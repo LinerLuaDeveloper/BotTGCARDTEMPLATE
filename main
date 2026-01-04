@@ -259,16 +259,18 @@ BUTTON_COOLDOWNS = {
     'craft': 3
 }
 
-# Система антиспама
+# Система антиспама - НАСТРОЙКИ
 SPAM_DETECTION_WINDOW = 10  # Секунды для окна детекции спама
-SPAM_MESSAGE_LIMIT = 8      # Максимум сообщений в окне
-SPAM_COMMAND_LIMIT = 5      # Максимум одинаковых команд в окне
+SPAM_MESSAGE_LIMIT = 6      # Максимум сообщений в окне (уменьшил для лучшей детекции)
+SPAM_COMMAND_LIMIT = 4      # Максимум одинаковых команд в окне
 AUTO_MUTE_DURATIONS = [     # Прогрессивные муты за спам
     timedelta(minutes=5),   # 1-е нарушение: 5 минут
-    timedelta(minutes=30),  # 2-е нарушение: 30 минут
-    timedelta(hours=1),     # 3-е нарушение: 1 час
-    timedelta(hours=6),     # 4-е нарушение: 6 часов
-    timedelta(days=1)       # 5-е нарушение: 1 день
+    timedelta(minutes=15),  # 2-е нарушение: 15 минут
+    timedelta(minutes=30),  # 3-е нарушение: 30 минут
+    timedelta(hours=1),     # 4-е нарушение: 1 час
+    timedelta(hours=3),     # 5-е нарушение: 3 часа
+    timedelta(hours=6),     # 6-е нарушение: 6 часов
+    timedelta(days=1)       # 7-е нарушение: 1 день
 ]
 
 # Словари для хранения состояний
@@ -283,10 +285,13 @@ USER_PRICE_INPUT_STATES = {}  # Для отслеживания пользова
 USER_CRAFT_STATES = {}  # Для отслеживания пользователей в процессе крафта
 recipe_states = {}  # Для состояний создания рецептов
 
-# Система антиспама
+# Система антиспама - ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
 user_message_history = defaultdict(list)  # История сообщений по пользователям
 user_spam_violations = defaultdict(int)   # Количество нарушений антиспама по пользователям
-recent_spam_messages = []  # Недавние сообщения спама для логирования
+ignored_users = set()  # Пользователи, которых игнорируем после мута
+user_last_message_time = {}  # Время последнего сообщения пользователя
+user_message_count = defaultdict(int)  # Счетчик сообщений пользователя
+user_command_history = defaultdict(list)  # История команд пользователя
 
 def init_db():
     conn = sqlite3.connect('cats.db')
@@ -448,6 +453,11 @@ def is_user_muted(user_id):
             cursor.execute('DELETE FROM mutes WHERE user_id = ?', (user_id,))
             conn.commit()
             conn.close()
+            
+            # Удаляем из списка игнорируемых
+            if user_id in ignored_users:
+                ignored_users.remove(user_id)
+                
             return False
         return True
     
@@ -534,141 +544,70 @@ def remove_active_selection(user_id, selection_type):
     if key in ACTIVE_SELECTIONS:
         del ACTIVE_SELECTIONS[key]
 
-def is_card_already_selling(user_id, card_id):
-    """Проверяет, выставлена ли карточка уже на продажу"""
-    conn = sqlite3.connect('cats.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT id FROM market WHERE card_id = ?', (card_id,))
-    result = cursor.fetchone()
-    conn.close()
-    return result is not None
-
-def add_card_selling_state(user_id, card_id):
-    """Добавляет карточку в состояние продажи"""
-    key = f"{user_id}_selling"
-    if key not in CARD_SELLING_STATES:
-        CARD_SELLING_STATES[key] = set()
-    CARD_SELLING_STATES[key].add(card_id)
-
-def remove_card_selling_state(user_id, card_id):
-    """Удаляет карточку из состояния продажи"""
-    key = f"{user_id}_selling"
-    if key in CARD_SELLING_STATES and card_id in CARD_SELLING_STATES[key]:
-        CARD_SELLING_STATES[key].remove(card_id)
-
-def is_card_in_selling_state(user_id, card_id):
-    """Проверяет, находится ли карточка в состоянии продажи"""
-    key = f"{user_id}_selling"
-    return key in CARD_SELLING_STATES and card_id in CARD_SELLING_STATES[key]
-
-def add_user_selling_state(user_id, card_id):
-    """Добавляет пользователя в состояние продажи"""
-    USER_SELLING_STATES[user_id] = {
-        'card_id': card_id,
-        'start_time': time.time()
-    }
-
-def remove_user_selling_state(user_id):
-    """Удаляет пользователя из состояния продажи"""
-    if user_id in USER_SELLING_STATES:
-        del USER_SELLING_STATES[user_id]
-
-def is_user_in_selling_state(user_id):
-    """Проверяет, находится ли пользователь в состоянии продажи"""
-    return user_id in USER_SELLING_STATES
-
-def get_user_selling_card(user_id):
-    """Получает карточку, которую пользователь пытается продать"""
-    if user_id in USER_SELLING_STATES:
-        return USER_SELLING_STATES[user_id]['card_id']
-    return None
-
-def add_user_price_input_state(user_id, card_id):
-    """Добавляет пользователя в состояние ввода цены"""
-    USER_PRICE_INPUT_STATES[user_id] = {
-        'card_id': card_id,
-        'start_time': time.time()
-    }
-
-def remove_user_price_input_state(user_id):
-    """Удаляет пользователя из состояния ввода цены"""
-    if user_id in USER_PRICE_INPUT_STATES:
-        del USER_PRICE_INPUT_STATES[user_id]
-
-def is_user_in_price_input_state(user_id):
-    """Проверяет, находится ли пользователь в состоянии ввода цены"""
-    return user_id in USER_PRICE_INPUT_STATES
-
-def get_user_price_input_card(user_id):
-    """Получает карточку, для которой пользователь вводит цену"""
-    if user_id in USER_PRICE_INPUT_STATES:
-        return USER_PRICE_INPUT_STATES[user_id]['card_id']
-    return None
-
-def add_user_craft_state(user_id, target_card):
-    """Добавляет пользователя в состояние крафта"""
-    USER_CRAFT_STATES[user_id] = {
-        'target_card': target_card,
-        'start_time': time.time()
-    }
-
-def remove_user_craft_state(user_id):
-    """Удаляет пользователя из состояния крафта"""
-    if user_id in USER_CRAFT_STATES:
-        del USER_CRAFT_STATES[user_id]
-
-def is_user_in_craft_state(user_id):
-    """Проверяет, находится ли пользователь в состоянии крафта"""
-    return user_id in USER_CRAFT_STATES
-
-def get_user_craft_target(user_id):
-    """Получает карточку, которую пользователь пытается скрафтить"""
-    if user_id in USER_CRAFT_STATES:
-        return USER_CRAFT_STATES[user_id]['target_card']
-    return None
-
-# СИСТЕМА АНТИСПАМА
-def track_user_message(user_id, message_text, message_type="text"):
-    """Отслеживает сообщения пользователя для обнаружения спама"""
+# СИСТЕМА АНТИСПАМА - ОСНОВНЫЕ ФУНКЦИИ
+def check_spam_early(user_id, message_text):
+    """БЫСТРАЯ ПРОВЕРКА на спам ДО обработки команды"""
     current_time = time.time()
     
-    # Очищаем старые сообщения
-    user_history = user_message_history[user_id]
-    user_history = [msg for msg in user_history if current_time - msg['time'] <= SPAM_DETECTION_WINDOW]
-    
-    # Добавляем новое сообщение
-    user_history.append({
-        'time': current_time,
-        'text': message_text,
-        'type': message_type
-    })
-    
-    user_message_history[user_id] = user_history
-    
-    # Проверяем на спам
-    return check_for_spam(user_id, user_history)
-
-def check_for_spam(user_id, message_history):
-    """Проверяет, является ли активность пользователя спамом"""
-    if len(message_history) < SPAM_MESSAGE_LIMIT:
-        return False
-    
-    # Проверка 1: Слишком много сообщений за короткое время
-    if len(message_history) >= SPAM_MESSAGE_LIMIT:
-        logger.warning(f"Пользователь {user_id} отправил {len(message_history)} сообщений за {SPAM_DETECTION_WINDOW} секунд")
+    # Если пользователь в списке игнорируемых - сразу пропускаем
+    if user_id in ignored_users:
         return True
     
-    # Проверка 2: Слишком много одинаковых команд
-    if message_history:
-        commands = [msg['text'] for msg in message_history if msg['text'].startswith('/') or msg['text'] in ['🎴 Получить карточку', '📊 Мой профиль', '📋 Мои карточки', '🛒 Магазин', '📚 Все карточки', '🔨 Крафт']]
-        command_counts = {}
-        for cmd in commands:
-            command_counts[cmd] = command_counts.get(cmd, 0) + 1
+    # Проверяем слишком частые сообщения
+    if user_id in user_last_message_time:
+        time_since_last = current_time - user_last_message_time[user_id]
+        if time_since_last < 0.5:  # Меньше 0.5 секунды между сообщениями
+            user_message_count[user_id] += 1
+        else:
+            user_message_count[user_id] = 1
+    else:
+        user_message_count[user_id] = 1
+    
+    user_last_message_time[user_id] = current_time
+    
+    # Если слишком много сообщений за короткое время
+    if user_message_count[user_id] > 4:  # Более 4 сообщений подряд быстро
+        logger.warning(f"Пользователь {user_id} отправляет сообщения слишком быстро: {user_message_count[user_id]} сообщений")
+        return True
+    
+    # Обновляем историю команд
+    if user_id in user_command_history:
+        user_command_history[user_id].append({
+            'time': current_time,
+            'text': message_text,
+            'type': 'command' if message_text.startswith('/') or message_text in [
+                '🎴 Получить карточку', '📊 Мой профиль', '📋 Мои карточки', 
+                '🛒 Магазин', '📚 Все карточки', '🔨 Крафт'
+            ] else 'text'
+        })
         
-        for cmd, count in command_counts.items():
-            if count >= SPAM_COMMAND_LIMIT:
-                logger.warning(f"Пользователь {user_id} отправил команду '{cmd}' {count} раз за {SPAM_DETECTION_WINDOW} секунд")
-                return True
+        # Очищаем старые записи (старше 10 секунд)
+        user_command_history[user_id] = [
+            cmd for cmd in user_command_history[user_id] 
+            if current_time - cmd['time'] <= SPAM_DETECTION_WINDOW
+        ]
+        
+        # Проверяем на спам команд
+        if len(user_command_history[user_id]) >= SPAM_COMMAND_LIMIT:
+            # Проверяем одинаковые команды
+            command_counts = {}
+            for cmd in user_command_history[user_id]:
+                if cmd['type'] == 'command':
+                    command_counts[cmd['text']] = command_counts.get(cmd['text'], 0) + 1
+            
+            for cmd_text, count in command_counts.items():
+                if count >= SPAM_COMMAND_LIMIT:
+                    logger.warning(f"Пользователь {user_id} спамит командой '{cmd_text}' {count} раз")
+                    return True
+    else:
+        user_command_history[user_id] = [{
+            'time': current_time,
+            'text': message_text,
+            'type': 'command' if message_text.startswith('/') or message_text in [
+                '🎴 Получить карточку', '📊 Мой профиль', '📋 Мои карточки', 
+                '🛒 Магазин', '📚 Все карточки', '🔨 Крафт'
+            ] else 'text'
+        }]
     
     return False
 
@@ -700,14 +639,21 @@ def auto_mute_user(user_id, username, reason="Автоматическое об�
         conn.commit()
         conn.close()
         
+        # Добавляем пользователя в список игнорируемых
+        ignored_users.add(user_id)
+        
+        # Очищаем историю пользователя
+        if user_id in user_command_history:
+            del user_command_history[user_id]
+        if user_id in user_message_count:
+            del user_message_count[user_id]
+        if user_id in user_last_message_time:
+            del user_last_message_time[user_id]
+        
         # Логируем мут
         logger.warning(f"Пользователь {user_id} (@{username}) автоматически заглушен на {mute_duration}. Нарушение #{violation_count}")
         
-        # Очищаем историю сообщений пользователя
-        if user_id in user_message_history:
-            del user_message_history[user_id]
-        
-        # Отправляем уведомление пользователю
+        # Отправляем уведомление пользователю В ЛИЧНЫЕ СООБЩЕНИЯ
         try:
             hours = mute_duration.seconds // 3600
             minutes = (mute_duration.seconds % 3600) // 60
@@ -727,10 +673,10 @@ def auto_mute_user(user_id, username, reason="Автоматическое об�
             mute_message += f"Если вы считаете, что это ошибка, свяжитесь с администратором."
             
             bot.send_message(user_id, mute_message)
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Не удалось отправить сообщение о муте пользователю {user_id}: {e}")
         
-        # Уведомляем администраторов
+        # Уведомляем администраторов ТОЛЬКО В ЛС
         for admin_id in OWNER_IDS:
             try:
                 admin_message = f"🚨 АВТОМУТ: Пользователь @{username} ({user_id})\n"
@@ -746,60 +692,38 @@ def auto_mute_user(user_id, username, reason="Автоматическое об�
         logger.error(f"Ошибка при автоматическом муте пользователя {user_id}: {e}")
         return False
 
-def cleanup_old_messages():
-    """Очищает старые сообщения из истории"""
+def cleanup_old_data():
+    """Очищает старые данные из памяти"""
     current_time = time.time()
-    for user_id in list(user_message_history.keys()):
-        user_history = user_message_history[user_id]
-        user_history = [msg for msg in user_history if current_time - msg['time'] <= SPAM_DETECTION_WINDOW * 2]
+    
+    # Очищаем старые сообщения из истории команд
+    for user_id in list(user_command_history.keys()):
+        user_history = user_command_history[user_id]
+        user_history = [
+            cmd for cmd in user_history 
+            if current_time - cmd['time'] <= SPAM_DETECTION_WINDOW * 2
+        ]
         if user_history:
-            user_message_history[user_id] = user_history
+            user_command_history[user_id] = user_history
         else:
-            del user_message_history[user_id]
+            del user_command_history[user_id]
+    
+    # Очищаем счетчики для неактивных пользователей
+    cutoff_time = current_time - 300  # 5 минут
+    inactive_users = [
+        uid for uid, last_time in user_last_message_time.items()
+        if last_time < cutoff_time
+    ]
+    
+    for uid in inactive_users:
+        if uid in user_message_count:
+            del user_message_count[uid]
+        if uid in user_last_message_time:
+            del user_last_message_time[uid]
 
-# Декоратор для проверки бана
-def check_ban(func):
-    """Декоратор для проверки, забанен ли пользователь"""
-    def wrapper(message):
-        if message.date < BOT_START_TIME:
-            return
-            
-        user_id = message.from_user.id
-        
-        if is_user_banned(user_id):
-            ban_info = get_ban_info(user_id)
-            if ban_info:
-                username, reason, banned_by, banned_time = ban_info
-                # Отправляем сообщение в ЛС пользователю
-                try:
-                    bot.send_message(user_id, 
-                                   f"🚫 Вы забанены в боте!\n\n"
-                                   f"📝 Причина: {reason}\n"
-                                   f"⏰ Дата бана: {banned_time[:10]}\n\n"
-                                   f"Если вы считаете, что это ошибка, свяжитесь с администратором.")
-                except Exception as e:
-                    logger.error(f"Не удалось отправить сообщение о бане пользователю {user_id}: {e}")
-            return
-            
-        return func(message)
-    return wrapper
-
-# Декоратор для проверки бана в callback
-def check_ban_callback(func):
-    """Декоратор для проверки бана в callback"""
-    def wrapper(call):
-        user_id = call.from_user.id
-        
-        if is_user_banned(user_id):
-            bot.answer_callback_query(call.id, "🚫 Вы забанены в боте!", show_alert=True)
-            return
-            
-        return func(call)
-    return wrapper
-
-# Декоратор для проверки мута с антиспамом
-def check_mute_antispam(func):
-    """Декоратор для проверки мута с антиспам системой"""
+# ОСНОВНОЙ ДЕКОРАТОР С АНТИСПАМОМ
+def antispam_protection(func):
+    """Главный декоратор для защиты от спама"""
     def wrapper(message):
         if message.date < BOT_START_TIME:
             return
@@ -807,19 +731,57 @@ def check_mute_antispam(func):
         user_id = message.from_user.id
         username = message.from_user.username or message.from_user.first_name
         
-        # Очищаем старые сообщения
-        cleanup_old_messages()
+        # Периодическая очистка старых данных
+        cleanup_old_data()
         
-        # Только если это текстовое сообщение (не команда, не callback)
-        if message.text and not message.text.startswith('/') and message.text not in [
-            '🎴 Получить карточку', '📊 Мой профиль', '📋 Мои карточки', 
-            '🛒 Магазин', '📚 Все карточки', '🔨 Крафт'
-        ]:
-            # Проверяем на спам
-            if track_user_message(user_id, message.text):
-                # Если обнаружен спам - автомут
-                auto_mute_user(user_id, username)
+        # Если пользователь заглушен - проверяем, не истек ли мут
+        if is_user_muted(user_id):
+            # Удаляем из списка игнорируемых если мут истек
+            if user_id in ignored_users:
+                # Проверяем в базе данных
+                conn = sqlite3.connect('cats.db')
+                cursor = conn.cursor()
+                cursor.execute('SELECT unmute_time FROM mutes WHERE user_id = ?', (user_id,))
+                result = cursor.fetchone()
+                conn.close()
+                
+                if result and result[0]:
+                    unmute_time = datetime.fromisoformat(result[0])
+                    if datetime.now() > unmute_time:
+                        # Мут истек
+                        if user_id in ignored_users:
+                            ignored_users.remove(user_id)
+                        # Продолжаем обработку
+                        pass
+                    else:
+                        # Мут еще действует - игнорируем
+                        return
+                else:
+                    # Нет информации о муте - удаляем из игнорируемых
+                    if user_id in ignored_users:
+                        ignored_users.remove(user_id)
+        
+        # Если пользователь в списке игнорируемых - игнорируем
+        if user_id in ignored_users:
+            return
+        
+        # Проверка на спам (включая команды!)
+        message_text = message.text or ""
+        
+        # Проверяем только если это не пустое сообщение
+        if message_text:
+            if check_spam_early(user_id, message_text):
+                # Обнаружен спам - автомут
+                auto_mute_user(user_id, username, "Спам командами/сообщениями")
                 return
+        
+        # Проверяем бан
+        if is_user_banned(user_id):
+            try:
+                bot.send_message(user_id, "🚫 Вы забанены в боте!")
+            except:
+                pass
+            return
         
         # Проверяем мут
         if is_user_muted(user_id):
@@ -835,43 +797,47 @@ def check_mute_antispam(func):
                     cursor.execute('DELETE FROM mutes WHERE user_id = ?', (user_id,))
                     conn.commit()
                     conn.close()
+                    
+                    # Удаляем из списка игнорируемых
+                    if user_id in ignored_users:
+                        ignored_users.remove(user_id)
+                    
+                    # Продолжаем выполнение
                     return func(message)
                 
-                # Разрешаем только определенные команды
-                allowed_commands = ["🎴 Получить карточку", "📊 Мой профиль"]
+                # Разрешаем только определенные команды для заглушенных
+                allowed_commands = ["🎴 Получить карточку", "📊 Мой профиль", "/start"]
                 
-                if message.text in allowed_commands:
+                if message_text in allowed_commands:
                     return func(message)
                 else:
-                    # Формируем сообщение о муте
-                    if unmute_time:
-                        unmute_dt = datetime.fromisoformat(unmute_time)
-                        time_left = unmute_dt - datetime.now()
-                        hours = time_left.seconds // 3600
-                        minutes = (time_left.seconds % 3600) // 60
-                        mute_message = f"⏳ Мут истечет через: {hours}ч {minutes}м"
-                    else:
-                        mute_message = "♾️ Мут бессрочный"
-                    
-                    bot.send_message(message.chat.id,
-                                   f"🔇 Вы заглушены!\n\n"
-                                   f"📝 Причина: {reason}\n"
-                                   f"🔢 Нарушение: #{violation_count}\n"
-                                   f"{mute_message}\n\n"
-                                   f"Вам доступны только команды:\n"
-                                   f"• 🎴 Получить карточку\n"
-                                   f"• 📊 Мой профиль")
+                    # ИГНОРИРУЕМ команду, НЕ отправляем сообщение в группе
+                    # Только логируем
+                    logger.info(f"Заглушенный пользователь {user_id} пытался использовать команду: {message_text}")
                     return
-            
+        
+        # Если все проверки пройдены - выполняем функцию
         return func(message)
+    
     return wrapper
 
-# Декоратор для проверки мута в callback с антиспамом
-def check_mute_callback_antispam(func):
-    """Декоратор для проверки мута в callback с антиспам системой"""
+# ДЕКОРАТОР ДЛЯ CALLBACK С АНТИСПАМОМ
+def antispam_callback_protection(func):
+    """Декоратор для защиты callback от спама"""
     def wrapper(call):
         user_id = call.from_user.id
         
+        # Если пользователь в списке игнорируемых - игнорируем
+        if user_id in ignored_users:
+            bot.answer_callback_query(call.id)
+            return
+        
+        # Проверяем бан
+        if is_user_banned(user_id):
+            bot.answer_callback_query(call.id, "🚫 Вы забанены в боте!", show_alert=True)
+            return
+        
+        # Проверяем мут
         if is_user_muted(user_id):
             mute_info = get_mute_info(user_id)
             if mute_info:
@@ -885,9 +851,15 @@ def check_mute_callback_antispam(func):
                     cursor.execute('DELETE FROM mutes WHERE user_id = ?', (user_id,))
                     conn.commit()
                     conn.close()
+                    
+                    # Удаляем из списка игнорируемых
+                    if user_id in ignored_users:
+                        ignored_users.remove(user_id)
+                    
+                    # Продолжаем выполнение
                     return func(call)
                 
-                # Разрешаем только определенные callback
+                # Разрешаем только определенные callback для заглушенных
                 allowed_callbacks = ["view_all_cards", "view_my_collection", "page_all_", "page_my_"]
                 call_data = call.data
                 
@@ -895,18 +867,19 @@ def check_mute_callback_antispam(func):
                     if call_data.startswith(allowed):
                         return func(call)
                 
-                bot.answer_callback_query(call.id, f"🔇 Вы заглушены! Нарушение #{violation_count}", show_alert=True)
+                # Игнорируем callback для заглушенных
+                bot.answer_callback_query(call.id)
                 return
-            
+        
+        # Если все проверки пройдены - выполняем функцию
         return func(call)
+    
     return wrapper
 
 # НОВЫЕ КОМАНДЫ ДЛЯ ВЛАДЕЛЬЦЕВ - УПРАВЛЕНИЕ МУТАМИ И АНТИСПАМОМ
 @bot.message_handler(commands=['mute'])
+@antispam_protection
 def mute_user_command(message):
-    if message.date < BOT_START_TIME:
-        return
-        
     user_id = message.from_user.id
     
     if not is_owner(user_id):
@@ -984,6 +957,9 @@ def mute_user_command(message):
         ''', (target_user_id, username, user_id, reason, 
               unmute_time.isoformat() if unmute_time else None, violation_count))
         
+        # Добавляем в список игнорируемых
+        ignored_users.add(target_user_id)
+        
         # Сбрасываем счетчик нарушений антиспама
         if target_user_id in user_spam_violations:
             user_spam_violations[target_user_id] = violation_count
@@ -1006,6 +982,7 @@ def mute_user_command(message):
                         f"📝 Причина: {reason}\n"
                         f"🔢 Нарушение: #{violation_count}")
         
+        # Отправляем уведомление пользователю В ЛИЧНЫЕ СООБЩЕНИЯ
         try:
             if unmute_time:
                 mute_text = f"🔇 Вы были заглушены в боте!\n\n" \
@@ -1033,10 +1010,8 @@ def mute_user_command(message):
         bot.send_message(message.chat.id, f"❌ Ошибка: {str(e)}")
 
 @bot.message_handler(commands=['unmute'])
+@antispam_protection
 def unmute_user_command(message):
-    if message.date < BOT_START_TIME:
-        return
-        
     user_id = message.from_user.id
     
     if not is_owner(user_id):
@@ -1066,6 +1041,10 @@ def unmute_user_command(message):
         # Удаляем из мутов
         cursor.execute('DELETE FROM mutes WHERE user_id = ?', (target_user_id,))
         
+        # Удаляем из списка игнорируемых
+        if target_user_id in ignored_users:
+            ignored_users.remove(target_user_id)
+        
         # Сбрасываем счетчик нарушений
         if target_user_id in user_spam_violations:
             del user_spam_violations[target_user_id]
@@ -1075,6 +1054,7 @@ def unmute_user_command(message):
         
         bot.send_message(message.chat.id, f"✅ Пользователь @{username} разглушен!")
         
+        # Отправляем уведомление пользователю В ЛИЧНЫЕ СООБЩЕНИЯ
         try:
             bot.send_message(target_user_id, "🎉 Ваш мут снят! Теперь вы снова можете использовать все функции бота.")
         except:
@@ -1084,10 +1064,8 @@ def unmute_user_command(message):
         bot.send_message(message.chat.id, f"❌ Ошибка: {str(e)}")
 
 @bot.message_handler(commands=['mutelist'])
+@antispam_protection
 def mute_list_command(message):
-    if message.date < BOT_START_TIME:
-        return
-        
     user_id = message.from_user.id
     
     if not is_owner(user_id):
@@ -1133,10 +1111,8 @@ def mute_list_command(message):
     bot.send_message(message.chat.id, mutes_text)
 
 @bot.message_handler(commands=['clearexpiredmutes'])
+@antispam_protection
 def clear_expired_mutes_command(message):
-    if message.date < BOT_START_TIME:
-        return
-        
     user_id = message.from_user.id
     
     if not is_owner(user_id):
@@ -1157,6 +1133,11 @@ def clear_expired_mutes_command(message):
                 cursor.execute('DELETE FROM mutes WHERE user_id = ?', (user_id_db,))
                 cleared_count += 1
                 
+                # Удаляем из списка игнорируемых
+                if user_id_db in ignored_users:
+                    ignored_users.remove(user_id_db)
+                
+                # Отправляем уведомление пользователю В ЛИЧНЫЕ СООБЩЕНИЯ
                 try:
                     bot.send_message(user_id_db, "🎉 Ваш мут истек! Теперь вы снова можете использовать все функции бота.")
                 except:
@@ -1168,10 +1149,8 @@ def clear_expired_mutes_command(message):
     bot.send_message(message.chat.id, f"✅ Удалено {cleared_count} просроченных мутов!")
 
 @bot.message_handler(commands=['antispamstats'])
+@antispam_protection
 def antispam_stats_command(message):
-    if message.date < BOT_START_TIME:
-        return
-        
     user_id = message.from_user.id
     
     if not is_owner(user_id):
@@ -1181,8 +1160,9 @@ def antispam_stats_command(message):
     stats_text = "🚨 Статистика антиспама:\n\n"
     
     # Активные нарушения
-    stats_text += f"👥 Пользователей в истории: {len(user_message_history)}\n"
+    stats_text += f"👥 Пользователей в истории: {len(user_command_history)}\n"
     stats_text += f"⚠️ Активные нарушения: {len(user_spam_violations)}\n"
+    stats_text += f"🔇 Игнорируемых пользователей: {len(ignored_users)}\n"
     
     # Топ нарушителей
     if user_spam_violations:
@@ -1215,10 +1195,8 @@ def antispam_stats_command(message):
     bot.send_message(message.chat.id, stats_text)
 
 @bot.message_handler(commands=['resetspamstats'])
+@antispam_protection
 def reset_spam_stats_command(message):
-    if message.date < BOT_START_TIME:
-        return
-        
     user_id = message.from_user.id
     
     if not is_owner(user_id):
@@ -1229,8 +1207,11 @@ def reset_spam_stats_command(message):
         parts = message.text.split()
         if len(parts) == 1:
             # Сброс всей статистики
-            user_message_history.clear()
+            user_command_history.clear()
             user_spam_violations.clear()
+            user_message_count.clear()
+            user_last_message_time.clear()
+            ignored_users.clear()
             bot.send_message(message.chat.id, "✅ Вся статистика антиспама сброшена!")
             
         elif len(parts) == 2:
@@ -1249,78 +1230,29 @@ def reset_spam_stats_command(message):
             
             target_user_id = target_user[0]
             
-            if target_user_id in user_message_history:
-                del user_message_history[target_user_id]
+            if target_user_id in user_command_history:
+                del user_command_history[target_user_id]
             
             if target_user_id in user_spam_violations:
                 del user_spam_violations[target_user_id]
+            
+            if target_user_id in user_message_count:
+                del user_message_count[target_user_id]
+            
+            if target_user_id in user_last_message_time:
+                del user_last_message_time[target_user_id]
+            
+            if target_user_id in ignored_users:
+                ignored_users.remove(target_user_id)
             
             bot.send_message(message.chat.id, f"✅ Статистика антиспама для @{username} сброшена!")
             
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ Ошибка: {str(e)}")
 
-# НОВЫЕ КОМАНДЫ ДЛЯ ВЛАДЕЛЬЦЕВ - УПРАВЛЕНИЕ МАГАЗИНОМ
-@bot.message_handler(commands=['offshop'])
-def off_shop_command(message):
-    if message.date < BOT_START_TIME:
-        return
-        
-    user_id = message.from_user.id
-    
-    if not is_owner(user_id):
-        bot.send_message(message.chat.id, "❌ У вас нет прав для использования этой команды!")
-        return
-    
-    global SHOP_ENABLED
-    if not SHOP_ENABLED:
-        bot.send_message(message.chat.id, "❌ Магазин уже отключен!")
-        return
-    
-    SHOP_ENABLED = False
-    save_shop_status()
-    
-    bot.send_message(message.chat.id, "✅ Магазин отключен! Пользователи не могут покупать/продавать карточки.")
-
-@bot.message_handler(commands=['onshop'])
-def on_shop_command(message):
-    if message.date < BOT_START_TIME:
-        return
-        
-    user_id = message.from_user.id
-    
-    if not is_owner(user_id):
-        bot.send_message(message.chat.id, "❌ У вас нет прав для использования этой команды!")
-        return
-    
-    global SHOP_ENABLED
-    if SHOP_ENABLED:
-        bot.send_message(message.chat.id, "❌ Магазин уже включен!")
-        return
-    
-    SHOP_ENABLED = True
-    save_shop_status()
-    
-    bot.send_message(message.chat.id, "✅ Магазин включен! Пользователи снова могут покупать/продавать карточки.")
-
-@bot.message_handler(commands=['shopstatus'])
-def shop_status_command(message):
-    if message.date < BOT_START_TIME:
-        return
-        
-    user_id = message.from_user.id
-    
-    if not is_owner(user_id):
-        bot.send_message(message.chat.id, "❌ У вас нет прав для использования этой команды!")
-        return
-    
-    status = "🟢 ВКЛЮЧЕН" if SHOP_ENABLED else "🔴 ВЫКЛЮЧЕН"
-    bot.send_message(message.chat.id, f"📊 Статус магазина: {status}")
-
-# ОСНОВНЫЕ КОМАНДЫ С ПРОВЕРКОЙ БАНА И МУТА
+# ОСНОВНЫЕ КОМАНДЫ С АНТИСПАМ ЗАЩИТОЙ
 @bot.message_handler(commands=['start'])
-@check_ban
-@check_mute_antispam
+@antispam_protection
 def start_command(message):
     user_id = message.from_user.id
     username = message.from_user.username or message.from_user.first_name
@@ -1354,8 +1286,7 @@ def start_command(message):
     bot.send_message(message.chat.id, welcome_text, reply_markup=markup, parse_mode='Markdown')
 
 @bot.message_handler(func=lambda message: message.text == '🎴 Получить карточку')
-@check_ban
-@check_mute_antispam
+@antispam_protection
 def get_card(message):
     user_id = message.from_user.id
     
@@ -1409,8 +1340,7 @@ def get_card(message):
         bot.send_message(message.chat.id, card_text)
 
 @bot.message_handler(func=lambda message: message.text == '📊 Мой профиль')
-@check_ban
-@check_mute_antispam
+@antispam_protection
 def show_stats(message):
     user_id = message.from_user.id
     
@@ -1454,10 +1384,8 @@ def show_stats(message):
 
     bot.send_message(message.chat.id, stats_text)
 
-# ОСТАЛЬНЫЕ КОМАНДЫ С АНТИСПАМОМ
 @bot.message_handler(func=lambda message: message.text in ['📋 Мои карточки', '🛒 Магазин', '📚 Все карточки', '🔨 Крафт'])
-@check_ban
-@check_mute_antispam
+@antispam_protection
 def handle_other_commands(message):
     user_id = message.from_user.id
     command = message.text
@@ -1558,10 +1486,9 @@ def shop_menu(message):
 
     bot.send_message(message.chat.id, shop_text, reply_markup=markup, parse_mode='Markdown')
 
-# ОБРАБОТЧИК КНОПОК С ПРОВЕРКОЙ МУТА
+# ОБРАБОТЧИК КНОПОК С АНТИСПАМ ЗАЩИТОЙ
 @bot.callback_query_handler(func=lambda call: call.data.startswith(('view_', 'craft_', 'select_craft_card_', 'page_', 'craft_recipe_')))
-@check_ban_callback
-@check_mute_callback_antispam
+@antispam_callback_protection
 def handle_view_callback(call):
     user_id = call.from_user.id
     chat_id = call.message.chat.id
@@ -1695,35 +1622,34 @@ def show_user_collection_page(message, user_id, page):
     except:
         bot.send_message(message.chat.id, text, reply_markup=markup)
 
-# ОБРАБОТЧИК НЕИЗВЕСТНЫХ СООБЩЕНИЙ С АНТИСПАМОМ
-@bot.message_handler(func=lambda message: True)
-@check_ban
-@check_mute_antispam
-def handle_unknown(message):
-    user_id = message.from_user.id
-    username = message.from_user.username or message.from_user.first_name
+# ОБРАБОТЧИК НЕИЗВЕСТНЫХ КОМАНД
+@bot.message_handler(func=lambda message: message.text and message.text.startswith('/'))
+@antispam_protection
+def handle_unknown_command(message):
+    command = message.text.split()[0]
     
-    # Очищаем старые сообщения
-    cleanup_old_messages()
-    
-    # Только если это текстовое сообщение (не команда, не кнопка)
-    if message.text and not message.text.startswith('/') and message.text not in [
-        '🎴 Получить карточку', '📊 Мой профиль', '📋 Мои карточки', 
-        '🛒 Магазин', '📚 Все карточки', '🔨 Крафт'
-    ]:
-        # Проверяем на спам
-        if track_user_message(user_id, message.text):
-            # Если обнаружен спам - автомут
-            auto_mute_user(user_id, username)
-            return
-    
-    if message.text.startswith('/'):
+    if command not in ['/start', '/promo', '/mute', '/unmute', '/mutelist', 
+                      '/clearexpiredmutes', '/antispamstats', '/resetspamstats',
+                      '/banbot', '/unbanbot', '/offshop', '/onshop', '/shopstatus',
+                      '/clearinventory', '/removecoins', '/removecard', '/addcard',
+                      '/deletecard', '/hide_card', '/unhide_card', '/cards_list',
+                      '/give_coins', '/give_card', '/reset_cooldown', '/stats',
+                      '/broadcast', '/promolist', '/deletepromo', '/createpromo',
+                      '/editcard', '/addrecipe', '/deleterecipe', '/recipes']:
+        
         bot.send_message(message.chat.id, 
                         "❌ Неизвестная команда!\n\n"
                         "✨ Доступные команды:\n"
                         "• /start - начать работу\n"
                         "• /promo КОД - активировать промокод\n\n"
                         "Используйте кнопки меню для навигации.")
+
+# ОБРАБОТЧИК ЛЮБЫХ ДРУГИХ СООБЩЕНИЙ
+@bot.message_handler(func=lambda message: True)
+@antispam_protection
+def handle_any_message(message):
+    # Игнорируем любые другие сообщения (не команды, не кнопки)
+    pass
 
 # ЗАПУСК БОТА С ЗАГРУЗКОЙ ДАННЫХ
 if __name__ == "__main__":
@@ -1736,14 +1662,14 @@ if __name__ == "__main__":
     logger.info(f"Загружено карточек: {len(CARDS_DATABASE)}")
     logger.info(f"Загружено рецептов крафта: {len(CRAFT_RECIPES)}")
     
-    # Запускаем периодическую очистку старых сообщений
+    # Запускаем периодическую очистку старых данных
     import threading
     
     def periodic_cleanup():
         while True:
             time.sleep(300)  # Каждые 5 минут
-            cleanup_old_messages()
-            logger.debug("Очищена история старых сообщений")
+            cleanup_old_data()
+            logger.debug("Очищены старые данные антиспама")
     
     cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
     cleanup_thread.start()
