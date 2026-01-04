@@ -4,10 +4,11 @@ from telebot import types
 import time
 import random
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 import json
 import os
+from collections import defaultdict
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -168,11 +169,10 @@ DEFAULT_CARDS = {
     }
 }
 
-
 # Загрузка сохраненных данных
 def load_saved_data():
     global CARDS_DATABASE, HIDDEN_CARDS, SHOP_ENABLED, CRAFT_RECIPES
-
+    
     # Загрузка карточек
     if os.path.exists(CARDS_DB_FILE):
         try:
@@ -187,7 +187,7 @@ def load_saved_data():
     else:
         # Если файла нет, используем карточки по умолчанию
         CARDS_DATABASE.update(DEFAULT_CARDS)
-
+    
     # Загрузка скрытых карточек
     if os.path.exists(HIDDEN_CARDS_FILE):
         try:
@@ -197,7 +197,7 @@ def load_saved_data():
             logger.info(f"Загружено {len(hidden_list)} скрытых карточек")
         except Exception as e:
             logger.error(f"Ошибка загрузки скрытых карточек: {e}")
-
+    
     # Загрузка статуса магазина
     if os.path.exists(SHOP_STATUS_FILE):
         try:
@@ -207,7 +207,7 @@ def load_saved_data():
             logger.info(f"Статус магазина загружен: {'включен' if SHOP_ENABLED else 'выключен'}")
         except Exception as e:
             logger.error(f"Ошибка загрузки статуса магазина: {e}")
-
+    
     # Загрузка рецептов крафта
     if os.path.exists(CRAFT_RECIPES_FILE):
         try:
@@ -217,7 +217,6 @@ def load_saved_data():
         except Exception as e:
             logger.error(f"Ошибка загрузки рецептов крафта: {e}")
 
-
 # Сохранение данных
 def save_cards_database():
     try:
@@ -226,14 +225,12 @@ def save_cards_database():
     except Exception as e:
         logger.error(f"Ошибка сохранения карточек: {e}")
 
-
 def save_hidden_cards():
     try:
         with open(HIDDEN_CARDS_FILE, 'w', encoding='utf-8') as f:
             json.dump(list(HIDDEN_CARDS), f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"Ошибка сохранения скрытых карточек: {e}")
-
 
 def save_shop_status():
     try:
@@ -242,14 +239,12 @@ def save_shop_status():
     except Exception as e:
         logger.error(f"Ошибка сохранения статуса магазина: {e}")
 
-
 def save_craft_recipes():
     try:
         with open(CRAFT_RECIPES_FILE, 'w', encoding='utf-8') as f:
             json.dump(CRAFT_RECIPES, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"Ошибка сохранения рецептов крафта: {e}")
-
 
 # Владельцы бота
 OWNER_IDS = [7599616968, 5872295617, 8112013114]
@@ -264,6 +259,18 @@ BUTTON_COOLDOWNS = {
     'craft': 3
 }
 
+# Система антиспама
+SPAM_DETECTION_WINDOW = 10  # Секунды для окна детекции спама
+SPAM_MESSAGE_LIMIT = 8      # Максимум сообщений в окне
+SPAM_COMMAND_LIMIT = 5      # Максимум одинаковых команд в окне
+AUTO_MUTE_DURATIONS = [     # Прогрессивные муты за спам
+    timedelta(minutes=5),   # 1-е нарушение: 5 минут
+    timedelta(minutes=30),  # 2-е нарушение: 30 минут
+    timedelta(hours=1),     # 3-е нарушение: 1 час
+    timedelta(hours=6),     # 4-е нарушение: 6 часов
+    timedelta(days=1)       # 5-е нарушение: 1 день
+]
+
 # Словари для хранения состояний
 CARD_ADD_STATES = {}
 PROMO_CREATION_STATES = {}
@@ -276,6 +283,10 @@ USER_PRICE_INPUT_STATES = {}  # Для отслеживания пользова
 USER_CRAFT_STATES = {}  # Для отслеживания пользователей в процессе крафта
 recipe_states = {}  # Для состояний создания рецептов
 
+# Система антиспама
+user_message_history = defaultdict(list)  # История сообщений по пользователям
+user_spam_violations = defaultdict(int)   # Количество нарушений антиспама по пользователям
+recent_spam_messages = []  # Недавние сообщения спама для логирования
 
 def init_db():
     conn = sqlite3.connect('cats.db')
@@ -312,7 +323,7 @@ def init_db():
             FOREIGN KEY (card_id) REFERENCES user_cards (id)
         )
     ''')
-
+    
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS cooldowns (
             user_id INTEGER PRIMARY KEY,
@@ -320,7 +331,7 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users (user_id)
         )
     ''')
-
+    
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS button_cooldowns (
             user_id INTEGER,
@@ -373,13 +384,13 @@ def init_db():
             reason TEXT,
             muted_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             unmute_time TIMESTAMP,
+            violation_count INTEGER DEFAULT 1,
             FOREIGN KEY (muted_by) REFERENCES users (user_id)
         )
     ''')
 
     conn.commit()
     conn.close()
-
 
 def get_user(user_id, username):
     conn = sqlite3.connect('cats.db')
@@ -397,18 +408,15 @@ def get_user(user_id, username):
     conn.close()
     return user
 
-
 def get_random_card():
-    available_cards = [card for card in CARDS_DATABASE.keys()
-                       if card not in HIDDEN_CARDS and not CARDS_DATABASE[card].get('craft_only', False)]
+    available_cards = [card for card in CARDS_DATABASE.keys() 
+                      if card not in HIDDEN_CARDS and not CARDS_DATABASE[card].get('craft_only', False)]
     if not available_cards:
         return random.choice(list(CARDS_DATABASE.keys()))
     return random.choice(available_cards)
 
-
 def is_owner(user_id):
     return user_id in OWNER_IDS
-
 
 def is_user_banned(user_id):
     """Проверяет, забанен ли пользователь"""
@@ -419,7 +427,6 @@ def is_user_banned(user_id):
     conn.close()
     return banned is not None
 
-
 def is_user_muted(user_id):
     """Проверяет, заглушен ли пользователь"""
     conn = sqlite3.connect('cats.db')
@@ -427,10 +434,10 @@ def is_user_muted(user_id):
     cursor.execute('SELECT unmute_time FROM mutes WHERE user_id = ?', (user_id,))
     result = cursor.fetchone()
     conn.close()
-
+    
     if not result:
         return False
-
+    
     unmute_time = result[0]
     if unmute_time:
         # Проверяем, не истек ли мут
@@ -443,9 +450,8 @@ def is_user_muted(user_id):
             conn.close()
             return False
         return True
-
+    
     return True  # Перманентный мут
-
 
 def get_ban_info(user_id):
     """Получает информацию о бане пользователя"""
@@ -456,46 +462,42 @@ def get_ban_info(user_id):
     conn.close()
     return ban_info
 
-
 def get_mute_info(user_id):
     """Получает информацию о муте пользователя"""
     conn = sqlite3.connect('cats.db')
     cursor = conn.cursor()
-    cursor.execute('SELECT username, reason, muted_by, muted_time, unmute_time FROM mutes WHERE user_id = ?',
-                   (user_id,))
+    cursor.execute('SELECT username, reason, muted_by, muted_time, unmute_time, violation_count FROM mutes WHERE user_id = ?', (user_id,))
     mute_info = cursor.fetchone()
     conn.close()
     return mute_info
 
-
 def check_button_cooldown(user_id, button_type):
     """Проверяет КД на кнопку"""
     current_time = time.time()
-
+    
     conn = sqlite3.connect('cats.db')
     cursor = conn.cursor()
-
-    cursor.execute('SELECT last_press_time FROM button_cooldowns WHERE user_id = ? AND button_type = ?',
+    
+    cursor.execute('SELECT last_press_time FROM button_cooldowns WHERE user_id = ? AND button_type = ?', 
                    (user_id, button_type))
     result = cursor.fetchone()
-
+    
     if result:
         last_press = result[0]
         cooldown_time = BUTTON_COOLDOWNS.get(button_type, 3)
-
+        
         if current_time - last_press < cooldown_time:
             conn.close()
             return False
-
+    
     cursor.execute('''
         INSERT OR REPLACE INTO button_cooldowns (user_id, button_type, last_press_time) 
         VALUES (?, ?, ?)
     ''', (user_id, button_type, current_time))
-
+    
     conn.commit()
     conn.close()
     return True
-
 
 def is_valid_url(url):
     """Проверяет, является ли строка валидным URL"""
@@ -508,35 +510,29 @@ def is_valid_url(url):
         r'(?:/?|[/?]\S+)$', re.IGNORECASE)
     return re.match(regex, url) is not None
 
-
 def store_message_owner(message_id, user_id):
     """Сохраняет владельца сообщения с кнопками"""
     MESSAGE_OWNERS[message_id] = user_id
 
-
 def check_message_owner(message_id, user_id):
     """Проверяет, принадлежит ли сообщение пользователю"""
     return MESSAGE_OWNERS.get(message_id) == user_id
-
 
 def add_active_selection(user_id, card_id, selection_type):
     """Добавляет активный выбор карточки"""
     key = f"{user_id}_{selection_type}"
     ACTIVE_SELECTIONS[key] = card_id
 
-
 def check_active_selection(user_id, card_id, selection_type):
     """Проверяет, выбрал ли пользователь уже эту карточку"""
     key = f"{user_id}_{selection_type}"
     return ACTIVE_SELECTIONS.get(key) == card_id
-
 
 def remove_active_selection(user_id, selection_type):
     """Удаляет активный выбор"""
     key = f"{user_id}_{selection_type}"
     if key in ACTIVE_SELECTIONS:
         del ACTIVE_SELECTIONS[key]
-
 
 def is_card_already_selling(user_id, card_id):
     """Проверяет, выставлена ли карточка уже на продажу"""
@@ -547,7 +543,6 @@ def is_card_already_selling(user_id, card_id):
     conn.close()
     return result is not None
 
-
 def add_card_selling_state(user_id, card_id):
     """Добавляет карточку в состояние продажи"""
     key = f"{user_id}_selling"
@@ -555,19 +550,16 @@ def add_card_selling_state(user_id, card_id):
         CARD_SELLING_STATES[key] = set()
     CARD_SELLING_STATES[key].add(card_id)
 
-
 def remove_card_selling_state(user_id, card_id):
     """Удаляет карточку из состояния продажи"""
     key = f"{user_id}_selling"
     if key in CARD_SELLING_STATES and card_id in CARD_SELLING_STATES[key]:
         CARD_SELLING_STATES[key].remove(card_id)
 
-
 def is_card_in_selling_state(user_id, card_id):
     """Проверяет, находится ли карточка в состоянии продажи"""
     key = f"{user_id}_selling"
     return key in CARD_SELLING_STATES and card_id in CARD_SELLING_STATES[key]
-
 
 def add_user_selling_state(user_id, card_id):
     """Добавляет пользователя в состояние продажи"""
@@ -576,24 +568,20 @@ def add_user_selling_state(user_id, card_id):
         'start_time': time.time()
     }
 
-
 def remove_user_selling_state(user_id):
     """Удаляет пользователя из состояния продажи"""
     if user_id in USER_SELLING_STATES:
         del USER_SELLING_STATES[user_id]
 
-
 def is_user_in_selling_state(user_id):
     """Проверяет, находится ли пользователь в состоянии продажи"""
     return user_id in USER_SELLING_STATES
-
 
 def get_user_selling_card(user_id):
     """Получает карточку, которую пользователь пытается продать"""
     if user_id in USER_SELLING_STATES:
         return USER_SELLING_STATES[user_id]['card_id']
     return None
-
 
 def add_user_price_input_state(user_id, card_id):
     """Добавляет пользователя в состояние ввода цены"""
@@ -602,24 +590,20 @@ def add_user_price_input_state(user_id, card_id):
         'start_time': time.time()
     }
 
-
 def remove_user_price_input_state(user_id):
     """Удаляет пользователя из состояния ввода цены"""
     if user_id in USER_PRICE_INPUT_STATES:
         del USER_PRICE_INPUT_STATES[user_id]
 
-
 def is_user_in_price_input_state(user_id):
     """Проверяет, находится ли пользователь в состоянии ввода цены"""
     return user_id in USER_PRICE_INPUT_STATES
-
 
 def get_user_price_input_card(user_id):
     """Получает карточку, для которой пользователь вводит цену"""
     if user_id in USER_PRICE_INPUT_STATES:
         return USER_PRICE_INPUT_STATES[user_id]['card_id']
     return None
-
 
 def add_user_craft_state(user_id, target_card):
     """Добавляет пользователя в состояние крафта"""
@@ -628,17 +612,14 @@ def add_user_craft_state(user_id, target_card):
         'start_time': time.time()
     }
 
-
 def remove_user_craft_state(user_id):
     """Удаляет пользователя из состояния крафта"""
     if user_id in USER_CRAFT_STATES:
         del USER_CRAFT_STATES[user_id]
 
-
 def is_user_in_craft_state(user_id):
     """Проверяет, находится ли пользователь в состоянии крафта"""
     return user_id in USER_CRAFT_STATES
-
 
 def get_user_craft_target(user_id):
     """Получает карточку, которую пользователь пытается скрафтить"""
@@ -646,68 +627,206 @@ def get_user_craft_target(user_id):
         return USER_CRAFT_STATES[user_id]['target_card']
     return None
 
+# СИСТЕМА АНТИСПАМА
+def track_user_message(user_id, message_text, message_type="text"):
+    """Отслеживает сообщения пользователя для обнаружения спама"""
+    current_time = time.time()
+    
+    # Очищаем старые сообщения
+    user_history = user_message_history[user_id]
+    user_history = [msg for msg in user_history if current_time - msg['time'] <= SPAM_DETECTION_WINDOW]
+    
+    # Добавляем новое сообщение
+    user_history.append({
+        'time': current_time,
+        'text': message_text,
+        'type': message_type
+    })
+    
+    user_message_history[user_id] = user_history
+    
+    # Проверяем на спам
+    return check_for_spam(user_id, user_history)
+
+def check_for_spam(user_id, message_history):
+    """Проверяет, является ли активность пользователя спамом"""
+    if len(message_history) < SPAM_MESSAGE_LIMIT:
+        return False
+    
+    # Проверка 1: Слишком много сообщений за короткое время
+    if len(message_history) >= SPAM_MESSAGE_LIMIT:
+        logger.warning(f"Пользователь {user_id} отправил {len(message_history)} сообщений за {SPAM_DETECTION_WINDOW} секунд")
+        return True
+    
+    # Проверка 2: Слишком много одинаковых команд
+    if message_history:
+        commands = [msg['text'] for msg in message_history if msg['text'].startswith('/') or msg['text'] in ['🎴 Получить карточку', '📊 Мой профиль', '📋 Мои карточки', '🛒 Магазин', '📚 Все карточки', '🔨 Крафт']]
+        command_counts = {}
+        for cmd in commands:
+            command_counts[cmd] = command_counts.get(cmd, 0) + 1
+        
+        for cmd, count in command_counts.items():
+            if count >= SPAM_COMMAND_LIMIT:
+                logger.warning(f"Пользователь {user_id} отправил команду '{cmd}' {count} раз за {SPAM_DETECTION_WINDOW} секунд")
+                return True
+    
+    return False
+
+def auto_mute_user(user_id, username, reason="Автоматическое обнаружение спама"):
+    """Автоматически заглушает пользователя за спам"""
+    try:
+        # Получаем количество предыдущих нарушений
+        violation_count = user_spam_violations.get(user_id, 0) + 1
+        user_spam_violations[user_id] = violation_count
+        
+        # Определяем длительность мута
+        if violation_count <= len(AUTO_MUTE_DURATIONS):
+            mute_duration = AUTO_MUTE_DURATIONS[violation_count - 1]
+        else:
+            mute_duration = AUTO_MUTE_DURATIONS[-1]  # Максимальная длительность
+        
+        unmute_time = datetime.now() + mute_duration
+        
+        # Добавляем мут в базу данных
+        conn = sqlite3.connect('cats.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT OR REPLACE INTO mutes (user_id, username, muted_by, reason, unmute_time, violation_count) 
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, username, 0, f"{reason} (нарушение #{violation_count})", 
+              unmute_time.isoformat(), violation_count))
+        
+        conn.commit()
+        conn.close()
+        
+        # Логируем мут
+        logger.warning(f"Пользователь {user_id} (@{username}) автоматически заглушен на {mute_duration}. Нарушение #{violation_count}")
+        
+        # Очищаем историю сообщений пользователя
+        if user_id in user_message_history:
+            del user_message_history[user_id]
+        
+        # Отправляем уведомление пользователю
+        try:
+            hours = mute_duration.seconds // 3600
+            minutes = (mute_duration.seconds % 3600) // 60
+            
+            mute_message = f"🔇 Вы были автоматически заглушены за спам!\n\n"
+            mute_message += f"📝 Причина: {reason}\n"
+            mute_message += f"🔢 Нарушение: #{violation_count}\n"
+            
+            if hours > 0:
+                mute_message += f"⏰ Мут истечет через: {hours}ч {minutes}м\n"
+            else:
+                mute_message += f"⏰ Мут истечет через: {minutes} минут\n"
+            
+            mute_message += f"\n⚠️ Вам доступны только команды:\n"
+            mute_message += f"• 🎴 Получить карточку\n"
+            mute_message += f"• 📊 Мой профиль\n\n"
+            mute_message += f"Если вы считаете, что это ошибка, свяжитесь с администратором."
+            
+            bot.send_message(user_id, mute_message)
+        except:
+            pass
+        
+        # Уведомляем администраторов
+        for admin_id in OWNER_IDS:
+            try:
+                admin_message = f"🚨 АВТОМУТ: Пользователь @{username} ({user_id})\n"
+                admin_message += f"📝 Причина: {reason}\n"
+                admin_message += f"🔢 Нарушение: #{violation_count}\n"
+                admin_message += f"⏰ Длительность: {hours}ч {minutes}м"
+                bot.send_message(admin_id, admin_message)
+            except:
+                pass
+        
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка при автоматическом муте пользователя {user_id}: {e}")
+        return False
+
+def cleanup_old_messages():
+    """Очищает старые сообщения из истории"""
+    current_time = time.time()
+    for user_id in list(user_message_history.keys()):
+        user_history = user_message_history[user_id]
+        user_history = [msg for msg in user_history if current_time - msg['time'] <= SPAM_DETECTION_WINDOW * 2]
+        if user_history:
+            user_message_history[user_id] = user_history
+        else:
+            del user_message_history[user_id]
 
 # Декоратор для проверки бана
 def check_ban(func):
     """Декоратор для проверки, забанен ли пользователь"""
-
     def wrapper(message):
         if message.date < BOT_START_TIME:
             return
-
+            
         user_id = message.from_user.id
-
+        
         if is_user_banned(user_id):
             ban_info = get_ban_info(user_id)
             if ban_info:
                 username, reason, banned_by, banned_time = ban_info
                 # Отправляем сообщение в ЛС пользователю
                 try:
-                    bot.send_message(user_id,
-                                     f"🚫 Вы забанены в боте!\n\n"
-                                     f"📝 Причина: {reason}\n"
-                                     f"⏰ Дата бана: {banned_time[:10]}\n\n"
-                                     f"Если вы считаете, что это ошибка, свяжитесь с администратором.")
+                    bot.send_message(user_id, 
+                                   f"🚫 Вы забанены в боте!\n\n"
+                                   f"📝 Причина: {reason}\n"
+                                   f"⏰ Дата бана: {banned_time[:10]}\n\n"
+                                   f"Если вы считаете, что это ошибка, свяжитесь с администратором.")
                 except Exception as e:
                     logger.error(f"Не удалось отправить сообщение о бане пользователю {user_id}: {e}")
             return
-
+            
         return func(message)
-
     return wrapper
-
 
 # Декоратор для проверки бана в callback
 def check_ban_callback(func):
     """Декоратор для проверки бана в callback"""
-
     def wrapper(call):
         user_id = call.from_user.id
-
+        
         if is_user_banned(user_id):
             bot.answer_callback_query(call.id, "🚫 Вы забанены в боте!", show_alert=True)
             return
-
+            
         return func(call)
-
     return wrapper
 
-
-# Декоратор для проверки мута
-def check_mute(func):
-    """Декоратор для проверки, заглушен ли пользователь"""
-
+# Декоратор для проверки мута с антиспамом
+def check_mute_antispam(func):
+    """Декоратор для проверки мута с антиспам системой"""
     def wrapper(message):
         if message.date < BOT_START_TIME:
             return
-
+            
         user_id = message.from_user.id
-
+        username = message.from_user.username or message.from_user.first_name
+        
+        # Очищаем старые сообщения
+        cleanup_old_messages()
+        
+        # Только если это текстовое сообщение (не команда, не callback)
+        if message.text and not message.text.startswith('/') and message.text not in [
+            '🎴 Получить карточку', '📊 Мой профиль', '📋 Мои карточки', 
+            '🛒 Магазин', '📚 Все карточки', '🔨 Крафт'
+        ]:
+            # Проверяем на спам
+            if track_user_message(user_id, message.text):
+                # Если обнаружен спам - автомут
+                auto_mute_user(user_id, username)
+                return
+        
+        # Проверяем мут
         if is_user_muted(user_id):
             mute_info = get_mute_info(user_id)
             if mute_info:
-                username, reason, muted_by, muted_time, unmute_time = mute_info
-
+                username_db, reason, muted_by, muted_time, unmute_time, violation_count = mute_info
+                
                 # Проверяем, не истек ли мут
                 if unmute_time and datetime.now() > datetime.fromisoformat(unmute_time):
                     # Удаляем просроченный мут
@@ -717,48 +836,47 @@ def check_mute(func):
                     conn.commit()
                     conn.close()
                     return func(message)
-
-                # Формируем сообщение о муте
-                if unmute_time:
-                    unmute_dt = datetime.fromisoformat(unmute_time)
-                    time_left = unmute_dt - datetime.now()
-                    hours = time_left.seconds // 3600
-                    minutes = (time_left.seconds % 3600) // 60
-                    mute_message = f"⏳ Мут истечет через: {hours}ч {minutes}м"
-                else:
-                    mute_message = "♾️ Мут бессрочный"
-
+                
+                # Разрешаем только определенные команды
                 allowed_commands = ["🎴 Получить карточку", "📊 Мой профиль"]
-
+                
                 if message.text in allowed_commands:
                     return func(message)
                 else:
+                    # Формируем сообщение о муте
+                    if unmute_time:
+                        unmute_dt = datetime.fromisoformat(unmute_time)
+                        time_left = unmute_dt - datetime.now()
+                        hours = time_left.seconds // 3600
+                        minutes = (time_left.seconds % 3600) // 60
+                        mute_message = f"⏳ Мут истечет через: {hours}ч {minutes}м"
+                    else:
+                        mute_message = "♾️ Мут бессрочный"
+                    
                     bot.send_message(message.chat.id,
-                                     f"🔇 Вы заглушены!\n\n"
-                                     f"📝 Причина: {reason}\n"
-                                     f"⏰ Время мута: {mute_message}\n\n"
-                                     f"Вам доступны только команды:\n"
-                                     f"• 🎴 Получить карточку\n"
-                                     f"• 📊 Мой профиль")
+                                   f"🔇 Вы заглушены!\n\n"
+                                   f"📝 Причина: {reason}\n"
+                                   f"🔢 Нарушение: #{violation_count}\n"
+                                   f"{mute_message}\n\n"
+                                   f"Вам доступны только команды:\n"
+                                   f"• 🎴 Получить карточку\n"
+                                   f"• 📊 Мой профиль")
                     return
-
+            
         return func(message)
-
     return wrapper
 
-
-# Декоратор для проверки мута в callback
-def check_mute_callback(func):
-    """Декоратор для проверки мута в callback"""
-
+# Декоратор для проверки мута в callback с антиспамом
+def check_mute_callback_antispam(func):
+    """Декоратор для проверки мута в callback с антиспам системой"""
     def wrapper(call):
         user_id = call.from_user.id
-
+        
         if is_user_muted(user_id):
             mute_info = get_mute_info(user_id)
             if mute_info:
-                username, reason, muted_by, muted_time, unmute_time = mute_info
-
+                username, reason, muted_by, muted_time, unmute_time, violation_count = mute_info
+                
                 # Проверяем, не истек ли мут
                 if unmute_time and datetime.now() > datetime.fromisoformat(unmute_time):
                     # Удаляем просроченный мут
@@ -768,74 +886,66 @@ def check_mute_callback(func):
                     conn.commit()
                     conn.close()
                     return func(call)
-
+                
                 # Разрешаем только определенные callback
                 allowed_callbacks = ["view_all_cards", "view_my_collection", "page_all_", "page_my_"]
                 call_data = call.data
-
+                
                 for allowed in allowed_callbacks:
                     if call_data.startswith(allowed):
                         return func(call)
-
-                bot.answer_callback_query(call.id, "🔇 Вы заглушены! Доступны только базовые функции.", show_alert=True)
+                
+                bot.answer_callback_query(call.id, f"🔇 Вы заглушены! Нарушение #{violation_count}", show_alert=True)
                 return
-
+            
         return func(call)
-
     return wrapper
 
-
-# НОВЫЕ КОМАНДЫ ДЛЯ ВЛАДЕЛЬЦЕВ - УПРАВЛЕНИЕ МУТАМИ
+# НОВЫЕ КОМАНДЫ ДЛЯ ВЛАДЕЛЬЦЕВ - УПРАВЛЕНИЕ МУТАМИ И АНТИСПАМОМ
 @bot.message_handler(commands=['mute'])
 def mute_user_command(message):
     if message.date < BOT_START_TIME:
         return
-
+        
     user_id = message.from_user.id
-
+    
     if not is_owner(user_id):
         bot.send_message(message.chat.id, "❌ У вас нет прав для использования этой команды!")
         return
-
+    
     try:
         parts = message.text.split(' ', 3)
         if len(parts) < 3:
             bot.send_message(message.chat.id, "❌ Используйте: /mute @username время [причина]\n\n"
-                                              "Время можно указать:\n"
-                                              "• 1h - 1 час\n"
-                                              "• 30m - 30 минут\n"
-                                              "• 2d - 2 дня\n"
-                                              "• 0 - навсегда")
+                                           "Время можно указать:\n"
+                                           "• 1h - 1 час\n"
+                                           "• 30m - 30 минут\n"
+                                           "• 2d - 2 дня\n"
+                                           "• 0 - навсегда")
             return
-
+            
         username = parts[1].replace('@', '')
         time_str = parts[2].lower()
         reason = parts[3] if len(parts) > 3 else "Спам/Флуд"
-
+        
         conn = sqlite3.connect('cats.db')
         cursor = conn.cursor()
         cursor.execute('SELECT user_id FROM users WHERE username = ?', (username,))
         target_user = cursor.fetchone()
-
+        
         if not target_user:
             bot.send_message(message.chat.id, f"❌ Пользователь @{username} не найден!")
             conn.close()
             return
-
+            
         target_user_id = target_user[0]
-
+        
         # Проверяем, не забанен ли уже пользователь
         if is_user_banned(target_user_id):
             bot.send_message(message.chat.id, f"❌ Пользователь @{username} уже забанен!")
             conn.close()
             return
-
-        # Проверяем, не заглушен ли уже пользователь
-        if is_user_muted(target_user_id):
-            bot.send_message(message.chat.id, f"❌ Пользователь @{username} уже заглушен!")
-            conn.close()
-            return
-
+        
         # Парсим время
         unmute_time = None
         if time_str != "0":
@@ -857,16 +967,30 @@ def mute_user_command(message):
                 bot.send_message(message.chat.id, "❌ Неверный формат времени!")
                 conn.close()
                 return
-
-        # Добавляем мут
+        
+        # Проверяем, не заглушен ли уже пользователь
+        cursor.execute('SELECT violation_count FROM mutes WHERE user_id = ?', (target_user_id,))
+        existing_mute = cursor.fetchone()
+        
+        if existing_mute:
+            violation_count = existing_mute[0] + 1
+        else:
+            violation_count = 1
+        
+        # Добавляем или обновляем мут
         cursor.execute('''
-            INSERT OR REPLACE INTO mutes (user_id, username, muted_by, reason, unmute_time) 
-            VALUES (?, ?, ?, ?, ?)
-        ''', (target_user_id, username, user_id, reason, unmute_time.isoformat() if unmute_time else None))
-
+            INSERT OR REPLACE INTO mutes (user_id, username, muted_by, reason, unmute_time, violation_count) 
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (target_user_id, username, user_id, reason, 
+              unmute_time.isoformat() if unmute_time else None, violation_count))
+        
+        # Сбрасываем счетчик нарушений антиспама
+        if target_user_id in user_spam_violations:
+            user_spam_violations[target_user_id] = violation_count
+        
         conn.commit()
         conn.close()
-
+        
         # Формируем сообщение о муте
         if unmute_time:
             time_left = unmute_time - datetime.now()
@@ -875,117 +999,123 @@ def mute_user_command(message):
             time_message = f"{hours}ч {minutes}м"
         else:
             time_message = "навсегда"
-
-        bot.send_message(message.chat.id,
-                         f"✅ Пользователь @{username} заглушен!\n\n"
-                         f"⏰ Время: {time_message}\n"
-                         f"📝 Причина: {reason}")
-
+        
+        bot.send_message(message.chat.id, 
+                        f"✅ Пользователь @{username} заглушен!\n\n"
+                        f"⏰ Время: {time_message}\n"
+                        f"📝 Причина: {reason}\n"
+                        f"🔢 Нарушение: #{violation_count}")
+        
         try:
             if unmute_time:
                 mute_text = f"🔇 Вы были заглушены в боте!\n\n" \
-                            f"📝 Причина: {reason}\n" \
-                            f"⏰ Мут истечет через: {hours}ч {minutes}м\n\n" \
-                            f"Вам доступны только команды:\n" \
-                            f"• 🎴 Получить карточку\n" \
-                            f"• 📊 Мой профиль\n\n" \
-                            f"Если вы считаете, что это ошибка, свяжитесь с администратором."
+                          f"📝 Причина: {reason}\n" \
+                          f"🔢 Нарушение: #{violation_count}\n" \
+                          f"⏰ Мут истечет через: {hours}ч {minutes}м\n\n" \
+                          f"Вам доступны только команды:\n" \
+                          f"• 🎴 Получить карточку\n" \
+                          f"• 📊 Мой профиль\n\n" \
+                          f"Если вы считаете, что это ошибка, свяжитесь с администратором."
             else:
                 mute_text = f"🔇 Вы были заглушены в боте навсегда!\n\n" \
-                            f"📝 Причина: {reason}\n\n" \
-                            f"Вам доступны только команды:\n" \
-                            f"• 🎴 Получить карточку\n" \
-                            f"• 📊 Мой профиль\n\n" \
-                            f"Если вы считаете, что это ошибка, свяжитесь с администратором."
-
+                          f"📝 Причина: {reason}\n" \
+                          f"🔢 Нарушение: #{violation_count}\n\n" \
+                          f"Вам доступны только команды:\n" \
+                          f"• 🎴 Получить карточку\n" \
+                          f"• 📊 Мой профиль\n\n" \
+                          f"Если вы считаете, что это ошибка, свяжитесь с администратором."
+            
             bot.send_message(target_user_id, mute_text)
         except:
             pass
-
+            
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ Ошибка: {str(e)}")
-
 
 @bot.message_handler(commands=['unmute'])
 def unmute_user_command(message):
     if message.date < BOT_START_TIME:
         return
-
+        
     user_id = message.from_user.id
-
+    
     if not is_owner(user_id):
         bot.send_message(message.chat.id, "❌ У вас нет прав для использования этой команды!")
         return
-
+    
     try:
         parts = message.text.split()
         if len(parts) != 2:
             bot.send_message(message.chat.id, "❌ Используйте: /unmute @username")
             return
-
+            
         username = parts[1].replace('@', '')
-
+        
         conn = sqlite3.connect('cats.db')
         cursor = conn.cursor()
         cursor.execute('SELECT user_id FROM mutes WHERE username = ?', (username,))
         muted_user = cursor.fetchone()
-
+        
         if not muted_user:
             bot.send_message(message.chat.id, f"❌ Пользователь @{username} не найден в списке заглушенных!")
             conn.close()
             return
-
+            
         target_user_id = muted_user[0]
-
+        
         # Удаляем из мутов
         cursor.execute('DELETE FROM mutes WHERE user_id = ?', (target_user_id,))
-
+        
+        # Сбрасываем счетчик нарушений
+        if target_user_id in user_spam_violations:
+            del user_spam_violations[target_user_id]
+        
         conn.commit()
         conn.close()
-
+        
         bot.send_message(message.chat.id, f"✅ Пользователь @{username} разглушен!")
-
+        
         try:
             bot.send_message(target_user_id, "🎉 Ваш мут снят! Теперь вы снова можете использовать все функции бота.")
         except:
             pass
-
+            
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ Ошибка: {str(e)}")
-
 
 @bot.message_handler(commands=['mutelist'])
 def mute_list_command(message):
     if message.date < BOT_START_TIME:
         return
-
+        
     user_id = message.from_user.id
-
+    
     if not is_owner(user_id):
         bot.send_message(message.chat.id, "❌ У вас нет прав для использования этой команды!")
         return
-
+    
     conn = sqlite3.connect('cats.db')
     cursor = conn.cursor()
-
+    
     cursor.execute('''
-        SELECT username, reason, muted_by, muted_time, unmute_time 
+        SELECT username, reason, muted_by, muted_time, unmute_time, violation_count 
         FROM mutes 
         ORDER BY muted_time DESC
     ''')
     mutes = cursor.fetchall()
     conn.close()
-
+    
     if not mutes:
         bot.send_message(message.chat.id, "❌ Нет заглушенных пользователей!")
         return
-
+    
     mutes_text = "📋 Список заглушенных пользователей:\n\n"
-
-    for username, reason, muted_by, muted_time, unmute_time in mutes:
+    
+    for username, reason, muted_by, muted_time, unmute_time, violation_count in mutes:
         mutes_text += f"👤 @{username}\n"
         mutes_text += f"📝 Причина: {reason}\n"
-
+        mutes_text += f"🔢 Нарушение: #{violation_count}\n"
+        
         if unmute_time:
             unmute_dt = datetime.fromisoformat(unmute_time)
             if datetime.now() > unmute_dt:
@@ -997,29 +1127,28 @@ def mute_list_command(message):
                 mutes_text += f"⏰ Осталось: {hours}ч {minutes}м\n"
         else:
             mutes_text += f"⏰ Статус: Бессрочный\n"
-
+        
         mutes_text += f"📅 Заглушен: {muted_time[:10]}\n\n"
-
+    
     bot.send_message(message.chat.id, mutes_text)
-
 
 @bot.message_handler(commands=['clearexpiredmutes'])
 def clear_expired_mutes_command(message):
     if message.date < BOT_START_TIME:
         return
-
+        
     user_id = message.from_user.id
-
+    
     if not is_owner(user_id):
         bot.send_message(message.chat.id, "❌ У вас нет прав для использования этой команды!")
         return
-
+    
     conn = sqlite3.connect('cats.db')
     cursor = conn.cursor()
-
+    
     cursor.execute('SELECT user_id, username, unmute_time FROM mutes')
     all_mutes = cursor.fetchall()
-
+    
     cleared_count = 0
     for user_id_db, username, unmute_time in all_mutes:
         if unmute_time:
@@ -1027,193 +1156,171 @@ def clear_expired_mutes_command(message):
             if datetime.now() > unmute_dt:
                 cursor.execute('DELETE FROM mutes WHERE user_id = ?', (user_id_db,))
                 cleared_count += 1
-
+                
                 try:
-                    bot.send_message(user_id_db,
-                                     "🎉 Ваш мут истек! Теперь вы снова можете использовать все функции бота.")
+                    bot.send_message(user_id_db, "🎉 Ваш мут истек! Теперь вы снова можете использовать все функции бота.")
                 except:
                     pass
-
+    
     conn.commit()
     conn.close()
-
+    
     bot.send_message(message.chat.id, f"✅ Удалено {cleared_count} просроченных мутов!")
 
+@bot.message_handler(commands=['antispamstats'])
+def antispam_stats_command(message):
+    if message.date < BOT_START_TIME:
+        return
+        
+    user_id = message.from_user.id
+    
+    if not is_owner(user_id):
+        bot.send_message(message.chat.id, "❌ У вас нет прав для использования этой команды!")
+        return
+    
+    stats_text = "🚨 Статистика антиспама:\n\n"
+    
+    # Активные нарушения
+    stats_text += f"👥 Пользователей в истории: {len(user_message_history)}\n"
+    stats_text += f"⚠️ Активные нарушения: {len(user_spam_violations)}\n"
+    
+    # Топ нарушителей
+    if user_spam_violations:
+        stats_text += "\n📊 Топ нарушителей:\n"
+        sorted_violations = sorted(user_spam_violations.items(), key=lambda x: x[1], reverse=True)[:5]
+        
+        for user_id_db, count in sorted_violations:
+            try:
+                user = bot.get_chat(user_id_db)
+                username = user.username or user.first_name
+                stats_text += f"  • @{username}: {count} нарушений\n"
+            except:
+                stats_text += f"  • ID {user_id_db}: {count} нарушений\n"
+    
+    # Активные муты
+    conn = sqlite3.connect('cats.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM mutes')
+    active_mutes = cursor.fetchone()[0]
+    conn.close()
+    
+    stats_text += f"\n🔇 Активных мутов: {active_mutes}\n"
+    
+    # Параметры системы
+    stats_text += f"\n⚙️ Параметры системы:\n"
+    stats_text += f"  • Окно детекции: {SPAM_DETECTION_WINDOW} сек\n"
+    stats_text += f"  • Лимит сообщений: {SPAM_MESSAGE_LIMIT}\n"
+    stats_text += f"  • Лимит команд: {SPAM_COMMAND_LIMIT}\n"
+    
+    bot.send_message(message.chat.id, stats_text)
+
+@bot.message_handler(commands=['resetspamstats'])
+def reset_spam_stats_command(message):
+    if message.date < BOT_START_TIME:
+        return
+        
+    user_id = message.from_user.id
+    
+    if not is_owner(user_id):
+        bot.send_message(message.chat.id, "❌ У вас нет прав для использования этой команды!")
+        return
+    
+    try:
+        parts = message.text.split()
+        if len(parts) == 1:
+            # Сброс всей статистики
+            user_message_history.clear()
+            user_spam_violations.clear()
+            bot.send_message(message.chat.id, "✅ Вся статистика антиспама сброшена!")
+            
+        elif len(parts) == 2:
+            # Сброс для конкретного пользователя
+            username = parts[1].replace('@', '')
+            
+            conn = sqlite3.connect('cats.db')
+            cursor = conn.cursor()
+            cursor.execute('SELECT user_id FROM users WHERE username = ?', (username,))
+            target_user = cursor.fetchone()
+            conn.close()
+            
+            if not target_user:
+                bot.send_message(message.chat.id, f"❌ Пользователь @{username} не найден!")
+                return
+            
+            target_user_id = target_user[0]
+            
+            if target_user_id in user_message_history:
+                del user_message_history[target_user_id]
+            
+            if target_user_id in user_spam_violations:
+                del user_spam_violations[target_user_id]
+            
+            bot.send_message(message.chat.id, f"✅ Статистика антиспама для @{username} сброшена!")
+            
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка: {str(e)}")
 
 # НОВЫЕ КОМАНДЫ ДЛЯ ВЛАДЕЛЬЦЕВ - УПРАВЛЕНИЕ МАГАЗИНОМ
 @bot.message_handler(commands=['offshop'])
 def off_shop_command(message):
     if message.date < BOT_START_TIME:
         return
-
+        
     user_id = message.from_user.id
-
+    
     if not is_owner(user_id):
         bot.send_message(message.chat.id, "❌ У вас нет прав для использования этой команды!")
         return
-
+    
     global SHOP_ENABLED
     if not SHOP_ENABLED:
         bot.send_message(message.chat.id, "❌ Магазин уже отключен!")
         return
-
+    
     SHOP_ENABLED = False
     save_shop_status()
-
+    
     bot.send_message(message.chat.id, "✅ Магазин отключен! Пользователи не могут покупать/продавать карточки.")
-
 
 @bot.message_handler(commands=['onshop'])
 def on_shop_command(message):
     if message.date < BOT_START_TIME:
         return
-
+        
     user_id = message.from_user.id
-
+    
     if not is_owner(user_id):
         bot.send_message(message.chat.id, "❌ У вас нет прав для использования этой команды!")
         return
-
+    
     global SHOP_ENABLED
     if SHOP_ENABLED:
         bot.send_message(message.chat.id, "❌ Магазин уже включен!")
         return
-
+    
     SHOP_ENABLED = True
     save_shop_status()
-
+    
     bot.send_message(message.chat.id, "✅ Магазин включен! Пользователи снова могут покупать/продавать карточки.")
-
 
 @bot.message_handler(commands=['shopstatus'])
 def shop_status_command(message):
     if message.date < BOT_START_TIME:
         return
-
+        
     user_id = message.from_user.id
-
+    
     if not is_owner(user_id):
         bot.send_message(message.chat.id, "❌ У вас нет прав для использования этой команды!")
         return
-
+    
     status = "🟢 ВКЛЮЧЕН" if SHOP_ENABLED else "🔴 ВЫКЛЮЧЕН"
     bot.send_message(message.chat.id, f"📊 Статус магазина: {status}")
-
-
-# НОВЫЕ КОМАНДЫ ДЛЯ ВЛАДЕЛЬЦЕВ
-@bot.message_handler(commands=['banbot'])
-def ban_user_command(message):
-    if message.date < BOT_START_TIME:
-        return
-
-    user_id = message.from_user.id
-
-    if not is_owner(user_id):
-        bot.send_message(message.chat.id, "❌ У вас нет прав для использования этой команды!")
-        return
-
-    try:
-        parts = message.text.split(' ', 2)
-        if len(parts) < 2:
-            bot.send_message(message.chat.id, "❌ Используйте: /banbot @username [причина]")
-            return
-
-        username = parts[1].replace('@', '')
-        reason = parts[2] if len(parts) > 2 else "Не указана"
-
-        conn = sqlite3.connect('cats.db')
-        cursor = conn.cursor()
-        cursor.execute('SELECT user_id FROM users WHERE username = ?', (username,))
-        target_user = cursor.fetchone()
-
-        if not target_user:
-            bot.send_message(message.chat.id, f"❌ Пользователь @{username} не найден!")
-            conn.close()
-            return
-
-        target_user_id = target_user[0]
-
-        # Проверяем, не забанен ли уже пользователь
-        if is_user_banned(target_user_id):
-            bot.send_message(message.chat.id, f"❌ Пользователь @{username} уже забанен!")
-            conn.close()
-            return
-
-        # Добавляем в бан
-        cursor.execute('INSERT INTO bans (user_id, username, reason, banned_by) VALUES (?, ?, ?, ?)',
-                       (target_user_id, username, reason, user_id))
-
-        conn.commit()
-        conn.close()
-
-        bot.send_message(message.chat.id, f"✅ Пользователь @{username} забанен в боте!\n📝 Причина: {reason}")
-
-        try:
-            bot.send_message(target_user_id,
-                             f"🚫 Вы были забанены в боте!\n📝 Причина: {reason}\n\nЕсли вы считаете, что это ошибка, свяжитесь с администратором.")
-        except:
-            pass
-
-    except Exception as e:
-        bot.send_message(message.chat.id, f"❌ Ошибка: {str(e)}")
-
-
-@bot.message_handler(commands=['unbanbot'])
-def unban_user_command(message):
-    if message.date < BOT_START_TIME:
-        return
-
-    user_id = message.from_user.id
-
-    if not is_owner(user_id):
-        bot.send_message(message.chat.id, "❌ У вас нет прав для использования этой команды!")
-        return
-
-    try:
-        parts = message.text.split()
-        if len(parts) != 2:
-            bot.send_message(message.chat.id, "❌ Используйте: /unbanbot @username")
-            return
-
-        username = parts[1].replace('@', '')
-
-        conn = sqlite3.connect('cats.db')
-        cursor = conn.cursor()
-        cursor.execute('SELECT user_id FROM bans WHERE username = ?', (username,))
-        banned_user = cursor.fetchone()
-
-        if not banned_user:
-            bot.send_message(message.chat.id, f"❌ Пользователь @{username} не найден в списке забаненных!")
-            conn.close()
-            return
-
-        target_user_id = banned_user[0]
-
-        # Удаляем из бана
-        cursor.execute('DELETE FROM bans WHERE user_id = ?', (target_user_id,))
-
-        conn.commit()
-        conn.close()
-
-        bot.send_message(message.chat.id, f"✅ Пользователь @{username} разбанен в боте!")
-
-        try:
-            bot.send_message(target_user_id,
-                             "🎉 Вы были разбанены в боте! Теперь вы снова можете использовать все функции.")
-        except:
-            pass
-
-    except Exception as e:
-        bot.send_message(message.chat.id, f"❌ Ошибка: {str(e)}")
-
-
-# ОСТАЛЬНЫЕ КОМАНДЫ ДЛЯ ВЛАДЕЛЬЦЕВ (добавьте их здесь...)
-# ... [остальной код остается таким же, как в вашем исходном файле] ...
 
 # ОСНОВНЫЕ КОМАНДЫ С ПРОВЕРКОЙ БАНА И МУТА
 @bot.message_handler(commands=['start'])
 @check_ban
-@check_mute
+@check_mute_antispam
 def start_command(message):
     user_id = message.from_user.id
     username = message.from_user.username or message.from_user.first_name
@@ -1246,28 +1353,27 @@ def start_command(message):
 
     bot.send_message(message.chat.id, welcome_text, reply_markup=markup, parse_mode='Markdown')
 
-
 @bot.message_handler(func=lambda message: message.text == '🎴 Получить карточку')
 @check_ban
-@check_mute
+@check_mute_antispam
 def get_card(message):
     user_id = message.from_user.id
-
+    
     if not check_button_cooldown(user_id, 'get_card'):
         bot.send_message(message.chat.id, "⏳ Подождите немного перед следующим получением карточки!")
         return
-
+    
     username = message.from_user.username or message.from_user.first_name
     get_user(user_id, username)
-
+    
     conn = sqlite3.connect('cats.db')
     cursor = conn.cursor()
     cursor.execute('SELECT last_card_time FROM cooldowns WHERE user_id = ?', (user_id,))
     result = cursor.fetchone()
-
+    
     current_time = int(time.time())
     cooldown_seconds = 2 * 3600
-
+    
     if result and (current_time - result[0]) < cooldown_seconds:
         time_left = cooldown_seconds - (current_time - result[0])
         hours = time_left // 3600
@@ -1275,20 +1381,20 @@ def get_card(message):
         bot.send_message(message.chat.id, f"⏰ Следующую карточку можно будет получить через: {hours}ч {minutes}м")
         conn.close()
         return
-
+    
     card_name = get_random_card()
     card_data = CARDS_DATABASE[card_name]
-
+    
     cursor.execute('UPDATE users SET coins = coins + ?, total_cards = total_cards + 1 WHERE user_id = ?',
                    (card_data["coins"], user_id))
     cursor.execute('INSERT OR REPLACE INTO cooldowns (user_id, last_card_time) VALUES (?, ?)',
                    (user_id, current_time))
     cursor.execute('INSERT INTO user_cards (user_id, rarity, card_name) VALUES (?, ?, ?)',
                    (user_id, card_data["rarity"], card_name))
-
+    
     conn.commit()
     conn.close()
-
+    
     card_text = f"""Вам выпала карточка!
 
 🖼 Карточка: "{card_name}"
@@ -1302,23 +1408,22 @@ def get_card(message):
         logger.error(f"Error sending photo: {e}")
         bot.send_message(message.chat.id, card_text)
 
-
 @bot.message_handler(func=lambda message: message.text == '📊 Мой профиль')
 @check_ban
-@check_mute
+@check_mute_antispam
 def show_stats(message):
     user_id = message.from_user.id
-
+    
     if not check_button_cooldown(user_id, 'profile'):
         bot.send_message(message.chat.id, "⏳ Подождите немного перед следующим просмотром профиля!")
         return
-
+    
     conn = sqlite3.connect('cats.db')
     cursor = conn.cursor()
-
+    
     cursor.execute('SELECT coins, total_cards FROM users WHERE user_id = ?', (user_id,))
     user_stats = cursor.fetchone()
-
+    
     if not user_stats:
         bot.send_message(message.chat.id, "❌ Вы ещё не начали собирать карточки!")
         conn.close()
@@ -1349,50 +1454,114 @@ def show_stats(message):
 
     bot.send_message(message.chat.id, stats_text)
 
-
-# ОСТАЛЬНЫЕ КОМАНДЫ ТОЖЕ НУЖНО ОБНОВИТЬ С ДЕКОРАТОРОМ @check_mute
-# Например:
-@bot.message_handler(func=lambda message: message.text == '📋 Мои карточки')
+# ОСТАЛЬНЫЕ КОМАНДЫ С АНТИСПАМОМ
+@bot.message_handler(func=lambda message: message.text in ['📋 Мои карточки', '🛒 Магазин', '📚 Все карточки', '🔨 Крафт'])
 @check_ban
-@check_mute
-def show_cards(message):
+@check_mute_antispam
+def handle_other_commands(message):
     user_id = message.from_user.id
+    command = message.text
+    
+    if command == '📋 Мои карточки':
+        if not check_button_cooldown(user_id, 'my_cards'):
+            bot.send_message(message.chat.id, "⏳ Подождите немного перед следующим просмотром карточек!")
+            return
+        
+        conn = sqlite3.connect('cats.db')
+        cursor = conn.cursor()
 
-    if not check_button_cooldown(user_id, 'my_cards'):
-        bot.send_message(message.chat.id, "⏳ Подождите немного перед следующим просмотром карточек!")
+        cursor.execute('''
+            SELECT rarity, card_name, obtained_date 
+            FROM user_cards 
+            WHERE user_id = ? 
+            ORDER BY obtained_date DESC 
+            LIMIT 20
+        ''', (user_id,))
+        cards = cursor.fetchall()
+        conn.close()
+
+        if not cards:
+            bot.send_message(message.chat.id, "❌ У вас пока нет карточек!")
+            return
+
+        cards_text = "📋 Ваши последние карточки:\n\n"
+
+        for i, (rarity, card_name, date) in enumerate(cards, 1):
+            rarity_name = RARITIES[rarity]["name"]
+            cards_text += f"{i}. {rarity} {card_name} ({rarity_name})\n"
+
+        bot.send_message(message.chat.id, cards_text)
+    
+    elif command == '🛒 Магазин':
+        shop_menu(message)
+    
+    elif command == '📚 Все карточки':
+        if not check_button_cooldown(user_id, 'all_cards'):
+            bot.send_message(message.chat.id, "⏳ Подождите немного перед следующим просмотром!")
+            return
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("📖 Просмотр всех карточек", callback_data="view_all_cards"))
+        markup.add(types.InlineKeyboardButton("📊 Список моих карточек", callback_data="view_my_collection"))
+        
+        bot.send_message(message.chat.id, 
+                        "📚 Выберите режим просмотра карточек:",
+                        reply_markup=markup)
+    
+    elif command == '🔨 Крафт':
+        if not check_button_cooldown(user_id, 'craft'):
+            bot.send_message(message.chat.id, "⏳ Подождите немного перед следующим действием!")
+            return
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("📖 Просмотр рецептов крафта", callback_data="view_craft_recipes"))
+        markup.add(types.InlineKeyboardButton("🔨 Создать карточку", callback_data="start_craft"))
+        
+        bot.send_message(message.chat.id,
+                        "🔨 Мастерская крафта:\n\n"
+                        "Здесь вы можете создавать уникальные карточки, объединяя другие карточки!",
+                        reply_markup=markup)
+
+def shop_menu(message):
+    user_id = message.from_user.id
+    
+    # Проверяем, что это личные сообщения с ботом
+    if message.chat.type != 'private':
+        bot.send_message(message.chat.id, "❌ Магазин работает только в личных сообщениях с ботом! Напишите мне в ЛС.")
         return
-
-    conn = sqlite3.connect('cats.db')
-    cursor = conn.cursor()
-
-    cursor.execute('''
-        SELECT rarity, card_name, obtained_date 
-        FROM user_cards 
-        WHERE user_id = ? 
-        ORDER BY obtained_date DESC 
-        LIMIT 20
-    ''', (user_id,))
-    cards = cursor.fetchall()
-    conn.close()
-
-    if not cards:
-        bot.send_message(message.chat.id, "❌ У вас пока нет карточек!")
+    
+    if not check_button_cooldown(user_id, 'shop'):
+        bot.send_message(message.chat.id, "⏳ Подождите немного перед следующим действием в магазине!")
         return
+    
+    # Проверяем, включен ли магазин
+    if not SHOP_ENABLED:
+        bot.send_message(message.chat.id, "❌ Магазин временно отключен администратором!")
+        return
+    
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    btn1 = types.KeyboardButton('💰 Купить карточки')
+    btn2 = types.KeyboardButton('💎 Продать карточки')
+    btn3 = types.KeyboardButton('📋 Мои объявления')
+    btn4 = types.KeyboardButton('🎴 Получить карточку')
+    btn5 = types.KeyboardButton('📊 Мой профиль')
+    markup.add(btn1, btn2, btn3)
+    markup.add(btn4, btn5)
 
-    cards_text = "📋 Ваши последние карточки:\n\n"
+    shop_text = """🛒 Добро пожаловать в магазин карточек!
 
-    for i, (rarity, card_name, date) in enumerate(cards, 1):
-        rarity_name = RARITIES[rarity]["name"]
-        cards_text += f"{i}. {rarity} {card_name} ({rarity_name})\n"
+💰 **Купить карточки** - просмотреть карточки других игроков
+💎 **Продать карточки** - выставить свои карточки на продажу
+📋 **Мои объявления** - управление вашими продажами
 
-    bot.send_message(message.chat.id, cards_text)
+⏰ *Внимание: процесс продажи отменяется через 20 секунд бездействия*"""
 
+    bot.send_message(message.chat.id, shop_text, reply_markup=markup, parse_mode='Markdown')
 
 # ОБРАБОТЧИК КНОПОК С ПРОВЕРКОЙ МУТА
-@bot.callback_query_handler(
-    func=lambda call: call.data.startswith(('view_', 'craft_', 'select_craft_card_', 'page_', 'craft_recipe_')))
+@bot.callback_query_handler(func=lambda call: call.data.startswith(('view_', 'craft_', 'select_craft_card_', 'page_', 'craft_recipe_')))
 @check_ban_callback
-@check_mute_callback
+@check_mute_callback_antispam
 def handle_view_callback(call):
     user_id = call.from_user.id
     chat_id = call.message.chat.id
@@ -1403,92 +1572,90 @@ def handle_view_callback(call):
 
     if call.data == 'view_all_cards':
         show_all_cards_page(call.message, user_id, 0)
-
+        
     elif call.data == 'view_my_collection':
         show_user_collection_page(call.message, user_id, 0)
-
+        
     elif call.data == 'view_craft_recipes':
         show_craft_recipes(call.message, user_id)
-
+        
     elif call.data == 'start_craft':
         start_craft_selection(call.message, user_id)
-
+        
     elif call.data.startswith('select_craft_card_'):
         card_name = call.data.split('_', 3)[3]
         process_craft_selection(call.message, user_id, card_name)
-
+        
     elif call.data.startswith('page_all_'):
         page = int(call.data.split('_')[2])
         show_all_cards_page(call.message, user_id, page)
-
+        
     elif call.data.startswith('page_my_'):
         page = int(call.data.split('_')[2])
         show_user_collection_page(call.message, user_id, page)
-
+        
     elif call.data.startswith('craft_recipe_'):
         card_name = call.data.split('_', 2)[2]
         show_recipe_details(call.message, user_id, card_name)
 
     bot.answer_callback_query(call.id)
 
-
 # ФУНКЦИИ ДЛЯ ПРОСМОТРА КАРТОЧЕК (остаются без изменений)
 def show_all_cards_page(message, user_id, page):
     cards_per_page = 10
     all_cards = list(CARDS_DATABASE.keys())
     total_pages = (len(all_cards) + cards_per_page - 1) // cards_per_page
-
+    
     start_idx = page * cards_per_page
     end_idx = start_idx + cards_per_page
     page_cards = all_cards[start_idx:end_idx]
-
+    
     conn = sqlite3.connect('cats.db')
     cursor = conn.cursor()
-
+    
     text = f"📚 Все карточки (Страница {page + 1}/{total_pages}):\n\n"
-
+    
     for i, card_name in enumerate(page_cards, start_idx + 1):
         card_data = CARDS_DATABASE[card_name]
-
+        
         # Проверяем, есть ли карточка у пользователя
         cursor.execute('SELECT id FROM user_cards WHERE user_id = ? AND card_name = ?', (user_id, card_name))
         has_card = cursor.fetchone() is not None
-
+        
         status = "✅" if has_card else "❌"
         craft_only = "🔨" if card_data.get('craft_only', False) else ""
-
+        
         text += f"{status} {craft_only} {i}. {card_data['rarity']} {card_name}\n"
-
+    
     conn.close()
-
+    
     markup = types.InlineKeyboardMarkup()
-
+    
     # Кнопки навигации
     nav_buttons = []
     if page > 0:
-        nav_buttons.append(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"page_all_{page - 1}"))
+        nav_buttons.append(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"page_all_{page-1}"))
     if page < total_pages - 1:
-        nav_buttons.append(types.InlineKeyboardButton("Вперед ➡️", callback_data=f"page_all_{page + 1}"))
-
+        nav_buttons.append(types.InlineKeyboardButton("Вперед ➡️", callback_data=f"page_all_{page+1}"))
+    
     if nav_buttons:
         markup.row(*nav_buttons)
-
+    
     try:
         bot.edit_message_text(text, message.chat.id, message.message_id, reply_markup=markup)
     except:
         bot.send_message(message.chat.id, text, reply_markup=markup)
 
-
 def show_user_collection_page(message, user_id, page):
     cards_per_page = 10
-
+    
     conn = sqlite3.connect('cats.db')
     cursor = conn.cursor()
-
+    
     cursor.execute('SELECT COUNT(DISTINCT card_name) FROM user_cards WHERE user_id = ?', (user_id,))
     total_user_cards = cursor.fetchone()[0]
     total_pages = (total_user_cards + cards_per_page - 1) // cards_per_page
-
+    
     cursor.execute('''
         SELECT card_name, COUNT(*) as count 
         FROM user_cards 
@@ -1497,12 +1664,12 @@ def show_user_collection_page(message, user_id, page):
         ORDER BY card_name
         LIMIT ? OFFSET ?
     ''', (user_id, cards_per_page, page * cards_per_page))
-
+    
     user_cards = cursor.fetchall()
     conn.close()
-
+    
     text = f"📊 Моя коллекция (Страница {page + 1}/{total_pages}):\n\n"
-
+    
     for card_name, count in user_cards:
         if card_name in CARDS_DATABASE:
             card_data = CARDS_DATABASE[card_name]
@@ -1510,36 +1677,77 @@ def show_user_collection_page(message, user_id, page):
             text += f"✅ {craft_only} {card_data['rarity']} {card_name} ×{count}\n"
         else:
             text += f"✅ {card_name} ×{count}\n"
-
+    
     markup = types.InlineKeyboardMarkup()
-
+    
     # Кнопки навигации
     nav_buttons = []
     if page > 0:
-        nav_buttons.append(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"page_my_{page - 1}"))
+        nav_buttons.append(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"page_my_{page-1}"))
     if page < total_pages - 1:
-        nav_buttons.append(types.InlineKeyboardButton("Вперед ➡️", callback_data=f"page_my_{page + 1}"))
-
+        nav_buttons.append(types.InlineKeyboardButton("Вперед ➡️", callback_data=f"page_my_{page+1}"))
+    
     if nav_buttons:
         markup.row(*nav_buttons)
-
+    
     try:
         bot.edit_message_text(text, message.chat.id, message.message_id, reply_markup=markup)
     except:
         bot.send_message(message.chat.id, text, reply_markup=markup)
 
+# ОБРАБОТЧИК НЕИЗВЕСТНЫХ СООБЩЕНИЙ С АНТИСПАМОМ
+@bot.message_handler(func=lambda message: True)
+@check_ban
+@check_mute_antispam
+def handle_unknown(message):
+    user_id = message.from_user.id
+    username = message.from_user.username or message.from_user.first_name
+    
+    # Очищаем старые сообщения
+    cleanup_old_messages()
+    
+    # Только если это текстовое сообщение (не команда, не кнопка)
+    if message.text and not message.text.startswith('/') and message.text not in [
+        '🎴 Получить карточку', '📊 Мой профиль', '📋 Мои карточки', 
+        '🛒 Магазин', '📚 Все карточки', '🔨 Крафт'
+    ]:
+        # Проверяем на спам
+        if track_user_message(user_id, message.text):
+            # Если обнаружен спам - автомут
+            auto_mute_user(user_id, username)
+            return
+    
+    if message.text.startswith('/'):
+        bot.send_message(message.chat.id, 
+                        "❌ Неизвестная команда!\n\n"
+                        "✨ Доступные команды:\n"
+                        "• /start - начать работу\n"
+                        "• /promo КОД - активировать промокод\n\n"
+                        "Используйте кнопки меню для навигации.")
 
 # ЗАПУСК БОТА С ЗАГРУЗКОЙ ДАННЫХ
 if __name__ == "__main__":
     # Загружаем сохраненные данные
     load_saved_data()
-
+    
     init_db()
     logger.info("Бот запущен!")
     logger.info(f"Статус магазина: {'ВКЛЮЧЕН' if SHOP_ENABLED else 'ВЫКЛЮЧЕН'}")
     logger.info(f"Загружено карточек: {len(CARDS_DATABASE)}")
     logger.info(f"Загружено рецептов крафта: {len(CRAFT_RECIPES)}")
-
+    
+    # Запускаем периодическую очистку старых сообщений
+    import threading
+    
+    def periodic_cleanup():
+        while True:
+            time.sleep(300)  # Каждые 5 минут
+            cleanup_old_messages()
+            logger.debug("Очищена история старых сообщений")
+    
+    cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
+    cleanup_thread.start()
+    
     while True:
         try:
             logger.info("Запуск polling...")
